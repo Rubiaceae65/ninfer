@@ -159,8 +159,7 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
-    ThinkingControlOptions thinking;
-};
+    ThinkingControlOptions thinking;};
 
 struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
@@ -318,6 +317,9 @@ enum class ContextTransactionStatus : std::uint8_t {
     InProgress,
     Published,
     Aborted,
+    // Materialization rolled back with complete acknowledgements; retry this request.
+    // Unlike Aborted, this does not mean user cancellation or engine failure.
+    RetryableFailure,
 };
 
 enum class ContextTransactionReserveStatus : std::uint8_t {
@@ -599,8 +601,7 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
-    ExecutionTiming timing;
-};
+    ExecutionTiming timing;};
 
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;

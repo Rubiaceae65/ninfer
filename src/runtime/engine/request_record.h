@@ -190,7 +190,6 @@ struct RequestRecord {
     RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;
     MaterializationDiagnostics materialization_diagnostics;
-
     std::mutex mutex;
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;
