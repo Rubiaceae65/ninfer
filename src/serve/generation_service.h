@@ -54,8 +54,7 @@ struct GenerationOutcome {
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
-    std::optional<std::string> matched_stop_string;
-    GenerationMetrics metrics;
+    std::optional<std::string> matched_stop_string;    GenerationMetrics metrics;
 };
 
 struct StreamSink {

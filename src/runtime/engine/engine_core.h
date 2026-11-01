@@ -1339,7 +1339,17 @@ private:
         if (begin.reused_prompt_tokens > begin.prompt_tokens) {
             throw std::logic_error("admitted prefix exceeds its prompt");
         }
-        const std::uint32_t suffix_tokens = begin.prompt_tokens - begin.reused_prompt_tokens;
+        // L3 (disk) restore: a failed seed revises the runtime summary down to
+        // the honest reuse (0). The runtime may under-report the reuse but
+        // never exceed the admitted promise; the per-unit accounting always
+        // follows the ACTUAL summary so the prefill contract stays exact.
+        if (progress.summary.prompt_tokens != begin.prompt_tokens ||
+            progress.summary.prefix_reuse_path != begin.prefix_reuse_path ||
+            progress.summary.reused_prompt_tokens > begin.reused_prompt_tokens) {
+            throw std::logic_error("runtime Begin summary exceeds the committed admission");
+        }
+        const std::uint32_t suffix_tokens =
+            begin.prompt_tokens - progress.summary.reused_prompt_tokens;
         if (request->computed_prompt_tokens > suffix_tokens ||
             progress.processed_prompt_tokens > suffix_tokens - request->computed_prompt_tokens) {
             throw std::logic_error("prefill unit exceeded the admitted prompt suffix");
@@ -1362,7 +1372,10 @@ private:
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
-        if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
+        if (!request->admitted_begin ||
+            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens ||
+            progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
+            progress.summary.reused_prompt_tokens > request->admitted_begin->reused_prompt_tokens) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
@@ -1506,13 +1519,20 @@ private:
                     MaterializingRequest& control = *materializing_;
                     const std::uint32_t lane      = control.destination.value;
                     const auto request            = control.request;
-                    if (terminal.status == ContextTransactionStatus::Aborted) {
+                    if (terminal.status == ContextTransactionStatus::Aborted ||
+                        terminal.status == ContextTransactionStatus::RetryableFailure) {
                         if (terminal.activation) {
                             throw std::logic_error(
                                 "aborted materialization retained an activation");
                         }
                         materializing_.reset();
-                        complete_detached_cancelled(request);
+                        if (terminal.status == ContextTransactionStatus::RetryableFailure) {
+                            complete_error(request, std::make_exception_ptr(RequestError(
+                                RequestErrorKind::Unavailable,
+                                "materialization spill failed; owner retained; retry request")));
+                        } else {
+                            complete_detached_cancelled(request);
+                        }
                         request_admission_check();
                         publish_runtime_stats();
                         return AdmissionProgress::ControlProgress;
@@ -2030,7 +2050,26 @@ private:
                 } catch (...) {}
                 return;
             }
+            const bool context_pending = instance_.program->has_context_transaction();
             execution_lock.unlock();
+            // A context transaction can be waiting on a short async probe/write or CUDA
+            // event. Do not impose a 1ms sleep on every page/ticket; yield to its worker.
+            // Return through the normal boundary for cancellation and decode fairness.
+            // BOUNDED: a transaction that makes no progress for many yields is a
+            // STALLED spill, not a short wait — an unbounded yield() spin burns a
+            // core at 100% and starves the engine (observed: sched_yield spin in
+            // this loop for minutes while the spill queued no work). After a
+            // bounded streak, fall back to the same 1ms wait as the idle path.
+            if (context_pending) {
+                if (++context_yield_streak < 64) {
+                    std::this_thread::yield();
+                } else {
+                    std::unique_lock wait_lock(queue_mutex_);
+                    queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
+                }
+                continue;
+            }
+            context_yield_streak = 0;
             std::unique_lock wait_lock(queue_mutex_);
             queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
         }
@@ -2048,6 +2087,7 @@ private:
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
+    std::uint32_t context_yield_streak = 0;  // worker loop thread only
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;

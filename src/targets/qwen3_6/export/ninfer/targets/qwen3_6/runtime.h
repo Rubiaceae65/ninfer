@@ -724,8 +724,7 @@ struct PrefillProgress {
     bool complete                         = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch<Variant>> pending;
-    std::optional<CaptureOffer<Variant>> capture;
-};
+    std::optional<CaptureOffer<Variant>> capture;};
 
 enum class CaptureStatePlacement : std::uint8_t {
     DeviceFork,

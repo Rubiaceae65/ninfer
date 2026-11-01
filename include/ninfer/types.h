@@ -139,6 +139,22 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // L3 (disk) cold tier. Empty path = disabled (two-tier behavior, byte-identical).
+    // When set, host KV pages that are about to lose their last host replica
+    // (checkpoint drop under pressure) are spilled to per-family files under
+    // this directory so a later re-admission can restore them instead of
+    // re-prefilling. disk_kv_gib is the total spill budget (split across the
+    // KV families); 0 with a path set defaults to 64 GiB.
+    std::string disk_kv_path;
+    std::uint32_t disk_kv_gib = 0;
+    // Read side of the L3 tier: when a Root request arrives and its prefix
+    // [0, F) is restorable from disk (KV pages AND the GDN state image at F),
+    // materialize them into the fresh sequence (disk read + H2D + state load)
+    // and prefill only [F, prompt) instead of the whole prompt. Default off:
+    // with it off, the tier is write-only (probe/logging) and behavior is
+    // byte-identical to two-tier. Any restore failure falls back to full
+    // recompute (never worse than today).
+    bool disk_kv_restore = false;
 };
 
 struct ContextCostOptions {
@@ -262,8 +278,7 @@ struct OutputOptions {
 struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
-    OutputOptions output;
-};
+    OutputOptions output;};
 
 enum class MediaKind : std::uint8_t {
     Image,
@@ -802,8 +817,7 @@ struct GenerationResult {
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
-    ThinkingBudgetStats thinking;
-};
+    ThinkingBudgetStats thinking;};
 
 struct ArenaMemorySummary {
     std::size_t capacity_bytes  = 0;

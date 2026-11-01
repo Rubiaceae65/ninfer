@@ -1112,7 +1112,6 @@ public:
                                            ? std::numeric_limits<std::uint32_t>::max()
                                            : static_cast<std::uint32_t>(shared_references);
     }
-
     [[nodiscard]] CatalogState catalog_state(std::uint32_t slot) const noexcept {
         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
     }
@@ -2704,7 +2703,8 @@ private:
         };
 
         const bool published = result.status == ContextTransactionStatus::Published;
-        if ((!published && result.status != ContextTransactionStatus::Aborted) ||
+        if ((!published && result.status != ContextTransactionStatus::Aborted &&
+             result.status != ContextTransactionStatus::RetryableFailure) ||
             published != result.published.has_value()) {
             throw std::logic_error("materialization terminal status is invalid");
         }
@@ -2881,12 +2881,12 @@ private:
         observe_transfers(result);
         observe_operations(result);
 
-        if (result.status == ContextTransactionStatus::Aborted) {
+        if (!published) {
             restore_unreported_materialization(*record);
             lanes_[record->destination.value] = LogicalLaneState::Free;
             transaction_.template emplace<std::monostate>();
             program.finalize_context_transaction();
-            return {.status = ContextTransactionStatus::Aborted};
+            return {.status = result.status};
         }
 
         CatalogEntry& publication = catalog_[record->publication_slot];
