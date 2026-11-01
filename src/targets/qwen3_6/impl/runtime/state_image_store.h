@@ -197,6 +197,16 @@ public:
         return StateReplicaResidency::None;
     }
 
+    // Read-only access to this handle's host replica bytes (whole image_bytes
+    // block). Used by the disk-tier spill to copy the GDN/hidden state image
+    // to L3. Returns nullopt when the image is not currently host-resident.
+    [[nodiscard]] std::optional<qwen3_6::HostStateImageConstView> host_view(
+        StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (host_ == nullptr || !object.host_slot) { return std::nullopt; }
+        return host_->view(*object.host_slot);
+    }
+
     [[nodiscard]] std::uint64_t content_epoch(StateImageHandle handle) const {
         return require(handle).content_epoch;
     }

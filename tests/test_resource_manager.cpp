@@ -880,9 +880,10 @@ public:
         result.status = (abort_progress || cancellation.requested())
                             ? ContextTransactionStatus::Aborted
                             : ContextTransactionStatus::Published;
+        if (retryable_spill_failure) { result.status = ContextTransactionStatus::RetryableFailure; }
         for (std::size_t index = 0; index < plan.private_actions.size(); ++index) {
             const FakeTargetDecision& action = plan.private_actions[index];
-            const bool evicted               = action.evicts_continuation;
+            const bool evicted = action.evicts_continuation && !retryable_spill_failure;
             FakeMaterializationVictimResult victim{
                 .owner       = plan.private_planning_ids[index],
                 .disposition = evicted ? VictimDisposition::Evicted : VictimDisposition::Retained,
@@ -893,11 +894,11 @@ public:
                 const std::uint32_t owner_id = plan.private_owner_ids.at(index);
                 victim.final_summary.emplace();
                 const std::uint32_t content = sequence_content_keys_.at(owner_id);
-                if (action.dropped_checkpoints == 0 || malform_private_checkpoint_identity) {
+                if (retryable_spill_failure || action.dropped_checkpoints == 0 || malform_private_checkpoint_identity) {
                     victim.final_summary->endpoint = endpoint(content, finish_frontier);
                 }
                 if (finish_with_rewrite &&
-                    (action.dropped_checkpoints == 0 || !malform_private_checkpoint_identity)) {
+                    (retryable_spill_failure || action.dropped_checkpoints == 0 || !malform_private_checkpoint_identity)) {
                     victim.final_summary->rewrite =
                         rewrite_checkpoint(content, finish_frontier - 1U);
                 }
@@ -926,7 +927,7 @@ public:
         }
         if (plan.admission.private_source_id != 0) {
             result.source = FakeMaterializationSourceResult{
-                .mode = result.status == ContextTransactionStatus::Aborted
+                .mode = result.status != ContextTransactionStatus::Published
                             ? PrivateSourceMode::Retain
                             : plan.admission.source_mode};
         }
@@ -1135,6 +1136,7 @@ public:
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
     std::uint32_t reported_shared_active_references      = 0;
+    bool retryable_spill_failure = false;
     ContextTransactionStatus capture_status              = ContextTransactionStatus::Published;
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
@@ -2374,6 +2376,44 @@ void test_stale_revision_is_retryable() {
 }
 
 void test_materialization_abort_preserves_source() {
+    // Exercise retryable I/O failure separately from cancellation, including a
+    // planned owner eviction whose bytes have not been acknowledged by the writer.
+    {
+        FakeManager manager = make_manager(1, 2);
+        FakeProgram program;
+        const auto seed = start_active(manager, program, 50, make_base(50), 1);
+        (void)finish_active(manager, program, seed);
+        program.required_pressure_actions = 1;
+        program.require_evictions = true;
+        auto inspection = manager.inspect(program, FakePreparedPrompt{51}, make_base(51), 2);
+        require(inspection.choice.has_value(), "retryable spill test has no pressure plan");
+        program.retryable_spill_failure = true;
+        require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                    FakePreparedPrompt{51}, {}) == FakeManager::MaterializationReserveResult::Reserved,
+                "retryable spill test could not reserve");
+        auto progress = manager.progress_context_transaction(program, {});
+        auto outcome = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::RetryableFailure && !outcome.activation,
+                "spill failure was disguised as cancellation/publication");
+        require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+                "failed spill released its owner");
+        require(!program.has_context_transaction() &&
+                    manager.lane_state(LaneId{0}) == ninfer::runtime::LogicalLaneState::Free,
+                "failed spill retained the transaction or destination lane");
+        RuntimeStats stats;
+        manager.populate_runtime_stats(program, stats);
+        require(stats.pressure_private_owners_evicted == 0 &&
+                    stats.pressure_private_owners_degraded == 0,
+                "failed spill counted an uncommitted mutation");
+        program.retryable_spill_failure = false;
+        program.required_pressure_actions = 0;
+        program.require_evictions = false;
+        const auto next = start_active(manager, program, 50, make_base(50), 3);
+        require(program.started_source_id == seed.sequence.id,
+                "next request could not reuse retained owner");
+        (void)finish_active(manager, program, next);
+        std::cout << "PASS retryable spill: retained owner, free lane, next request completed\n";
+    }
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
     const ActiveRequest seed = start_active(manager, program, 5, make_base(5), 1);

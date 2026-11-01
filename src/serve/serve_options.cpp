@@ -76,6 +76,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
+           "[--disk-kv-path DIR] [--disk-kv-gib N] [--disk-kv-restore] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
@@ -233,6 +234,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-shared-prefixes"), "max-shared-prefixes"));
             context_capacity_explicit = true;
+        } else if (arg == "--disk-kv-path") {
+            const std::string path = require_value("--disk-kv-path");
+            if (path.empty()) {
+                throw std::invalid_argument("--disk-kv-path must not be empty");
+            }
+            options.context_cache.disk_kv_path = path;
+        } else if (arg == "--disk-kv-gib") {
+            const std::uint64_t gib = parse_u64(require_value("--disk-kv-gib"), "disk-kv-gib");
+            options.context_cache.disk_kv_gib = static_cast<std::uint32_t>(gib);
+        } else if (arg == "--disk-kv-restore") {
+            options.context_cache.disk_kv_restore = true;
         } else if (arg == "--max-long-anchors-per-continuation") {
             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
