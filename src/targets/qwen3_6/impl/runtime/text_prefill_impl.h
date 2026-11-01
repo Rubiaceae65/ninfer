@@ -36,6 +36,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    card.set_next_token_logits_capture(execution.next_token_logits_capture);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
@@ -143,6 +144,13 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    // Next-token distribution export (zero-suffix reuse path): stage the raw logit row before
+    // any MTP bridge overwrites io.logits.
+    if (state.execution.next_token_logits_capture != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(state.execution.next_token_logits_capture, logits.data,
+                                   TextConfig::token_domain * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, state.execution.device.stream));
+    }
     state.execution.work.reset();
 }
 

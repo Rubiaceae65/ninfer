@@ -77,6 +77,10 @@ public:
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
+    // Decodes one token id back to its UTF-8 surface text (the artifact tokenizer's rendering).
+    // Used to present exported next-token log probabilities as readable tokens.
+    [[nodiscard]] std::string decode_token(std::uint32_t token_id) const;
+
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);

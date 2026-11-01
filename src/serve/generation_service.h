@@ -55,6 +55,8 @@ struct GenerationOutcome {
     ninfer::ThinkingBudgetStats thinking;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
+    // Next-token top-K distribution of the first generated token (empty when not requested).
+    std::vector<ninfer::TopLogprob> next_token_top_logprobs;
     GenerationMetrics metrics;
 };
 

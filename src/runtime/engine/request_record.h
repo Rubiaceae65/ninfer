@@ -190,6 +190,9 @@ struct RequestRecord {
     RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;
     MaterializationDiagnostics materialization_diagnostics;
+    // Next-token top-K export for this request (see ResolvedExecutionOptions::top_logprobs);
+    // filled by the completing prefill step and copied into the final GenerationResult.
+    std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
 
     std::mutex mutex;
     std::condition_variable cv;

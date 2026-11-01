@@ -117,17 +117,19 @@ void validate_standard_output_controls(const Json& body) {
             bad_request("logprobs must be a boolean", "logprobs");
         }
         if (body.at("logprobs").get<bool>()) {
-            bad_request("logprobs=true requires per-token log probabilities in the response, which "
-                        "NInfer does not provide",
+            bad_request("logprobs=true requires per-token log probabilities for the whole "
+                        "completion, which NInfer does not provide; use top_logprobs to export "
+                        "the next-token distribution",
                         "logprobs", "logprobs_not_supported");
         }
     }
     if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
-        if (*top_logprobs != 0) {
-            bad_request(
-                "nonzero top_logprobs requires alternative-token probabilities in the response, "
-                "which NInfer does not provide",
-                "top_logprobs", "logprobs_not_supported");
+        if (*top_logprobs < 1 || *top_logprobs > 100) {
+            bad_request("top_logprobs must be in [1,100]", "top_logprobs");
+        }
+        if (body.contains("logprobs") && !body.at("logprobs").is_null() &&
+            body.at("logprobs").get<bool>()) {
+            bad_request("logprobs=true is not supported alongside top_logprobs", "logprobs");
         }
     }
 
@@ -794,6 +796,12 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
     }
 }
 
+void parse_top_logprobs(const Json& body, GenerationRequest& output) {
+    if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
+        output.top_logprobs = *top_logprobs;
+    }
+}
+
 struct TemplateOptions {
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
@@ -905,6 +913,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, output.generation);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
+    parse_top_logprobs(body, output.generation);
     parse_stream_options(body, output);
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);

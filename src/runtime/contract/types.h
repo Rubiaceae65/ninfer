@@ -160,6 +160,8 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Top-K next-token probability export (see ninfer::RequestOptions::top_logprobs).
+    std::optional<std::uint32_t> top_logprobs;
 };
 
 struct ResolvedRequestOptions {
@@ -318,6 +320,9 @@ enum class ContextTransactionStatus : std::uint8_t {
     InProgress,
     Published,
     Aborted,
+    // Materialization rolled back with complete acknowledgements; retry this request.
+    // Unlike Aborted, this does not mean user cancellation or engine failure.
+    RetryableFailure,
 };
 
 enum class ContextTransactionReserveStatus : std::uint8_t {
@@ -600,6 +605,10 @@ struct PrefillStepResult {
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
     ExecutionTiming timing;
+    // Exported only on the completing prefill step when the request asked for next-token
+    // probabilities (resolved top_logprobs): the exact full-vocabulary top-K of the first
+    // generated token. Absent for non-completing steps and requests without the export.
+    std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
 };
 
 struct RoundBudget {

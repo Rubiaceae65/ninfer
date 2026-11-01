@@ -57,6 +57,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
+        cache.rolling_retention                 = false;
         return options;
     }
 
@@ -108,6 +109,13 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
+    if (options.top_logprobs && *options.top_logprobs == 0) {
+        throw std::invalid_argument("top_logprobs must be positive");
+    }
+    if (options.top_logprobs && *options.top_logprobs > 100) {
+        throw std::invalid_argument("top_logprobs must be in [1,100]");
+    }
+    resolved.execution.top_logprobs            = options.top_logprobs;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -332,6 +340,16 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
         [&](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
             return target_ptr->loaded->frontend.tokenize_text(text);
+        },
+        impl_->active);
+}
+
+std::string Engine::decode_token(std::uint32_t token_id) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.decode_token(token_id);
         },
         impl_->active);
 }

@@ -421,6 +421,15 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
+    outcome.next_token_top_logprobs =
+        std::move(result.next_token_top_logprobs.value_or(std::vector<ninfer::TopLogprob>{}));
+    for (auto& entry : outcome.next_token_top_logprobs) {
+        try {
+            entry.token_text = engine_->decode_token(entry.token_id);
+        } catch (const std::exception&) {
+            entry.token_text.clear();
+        }
+    }
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

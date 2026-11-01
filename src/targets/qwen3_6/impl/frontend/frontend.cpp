@@ -1577,6 +1577,11 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
 }
 
+std::string Frontend::decode_token(std::uint32_t token_id) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    return std::string(impl_->tokenizer->decode_token_bytes(static_cast<int>(token_id), false));
+}
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,

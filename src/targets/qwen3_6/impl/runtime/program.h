@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "core/disk_kv_bridge.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -182,6 +183,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t root_rebuild_tail_begin = 0;
     qwen3_6::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
+    std::optional<std::uint32_t> top_logprobs;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControlPlan> vision_control_plan;
@@ -247,6 +249,7 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> shared_candidates;
     ops::SamplingConfig sampling;
+    std::optional<std::uint32_t> top_logprobs;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -465,6 +468,8 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // Top-K next-token export requested by this request (0/absent = no export).
+    std::optional<std::uint32_t> top_logprobs;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -475,6 +480,12 @@ struct RequestControl {
         std::uint64_t pending_capture_offer = 0;
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
+        // L3 (disk) restore: the reuse frontier the engine admission contract was
+        // built on (reusable_prompt_tokens at admission). Normally equal to base;
+        // a failed disk seed keeps the advertised value while prefill replays
+        // [advertised_base, cursor) unreported, so the engine-visible contract
+        // (suffix tokens = prompt_tokens - advertised_base) stays exact.
+        std::uint32_t advertised_base       = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
@@ -642,11 +653,25 @@ public:
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
+    // L3 (disk) restore scratch: reserved once at startup and held for the
+    // program's lifetime. The seed reads disk pages/state through these and
+    // never allocates from the shared host pools, so pool pressure (full
+    // state slots / KV arena) can neither fail nor block a restore.
+    std::optional<HostKVAllocation> l3_kv_scratch;
+    std::optional<HostKVAllocation> l3_backend_scratch;
+    std::optional<qwen3_6::HostStateSlotHandle> l3_state_scratch;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
     std::unique_ptr<HostKVExtentStore> host_kv_extents;
+    // L3 (disk) cold tier. Null unless --disk-kv-path is set. Content-keyed spill
+    // of host KV pages that are losing their last host replica under pressure;
+    // a later re-admission restores them from disk instead of re-prefilling.
+    std::unique_ptr<DiskKVBridge> disk_kv;
+    // Read side (--disk-kv-restore): seed a Root sequence's prefix [0,F) from
+    // disk. Default false => write-only tier (byte-identical two-tier behavior).
+    bool disk_kv_restore = false;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
@@ -675,6 +700,7 @@ public:
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    std::optional<PinnedHostBuffer> top_logprobs_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -783,6 +809,54 @@ private:
         std::uint8_t timer_mask    = 0;
     };
 
+    struct OwnerSpillProgress {
+        // Full main/backend chains, endpoint state, seam tails, seam state.
+        std::uint8_t stage = 0;
+        std::uint32_t page = 0;
+        bool probed = false;
+        bool writing = false;
+        bool ready = false;
+        bool failed = false;
+        SpillTicket ticket;
+        std::optional<CudaCompletionEvent> copy_done;
+        LogicalKVPageStore* pinned_store = nullptr;
+        std::optional<LogicalKVPageHandle> pinned_page;
+        std::span<const std::byte> bytes;
+        std::uint64_t saved = 0, dedup = 0, d2h = 0;
+        std::uint64_t state_saved = 0;  // endpoint/seam/anchor state images written
+        bool endpoint_valid_at_start = false;  // diagnostics: stage-2 gate
+        bool seam_valid_at_start = false;      // diagnostics: stage-3..5 gate
+        std::uint8_t last_logged_stage = 255;  // stage-transition diagnostics
+        // Stall heartbeat: names the exact blocked sub-state when a spill
+        // makes no progress for seconds (see progress_owner_spill).
+        std::uint64_t last_seen_saved = 0;
+        std::uint8_t last_seen_stage = 0;
+        std::uint32_t last_seen_page = 0;
+        std::chrono::steady_clock::time_point last_progress_at = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last_warn_at = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        // Batched D2H for device-only chain pages: consecutive pages are pinned,
+        // copied in ONE transfer + ONE event into the reserved scratch, then
+        // submitted as individual tickets (per-page ~6ms pin+copy+event round
+        // trips dominated cold-owner spill time).
+        std::vector<LogicalKVPageHandle> batch_pages;       // pinned device pages
+        std::vector<DeviceKVPageHandle> batch_physical;     // their device handles
+        std::vector<DiskKVIdentity> batch_ids;              // page-order identities
+        std::vector<SpillTicket> batch_tickets;             // submitted writes
+        std::uint32_t batch_submit = 0;                     // next id to submit
+        DiskKVKind batch_kind = DiskKVKind::MainKV;
+        std::size_t batch_stride = 0;
+        bool batch_copy_pending = false;
+    };
+    bool progress_owner_spill(SequenceState& sequence, OwnerSpillProgress& progress);
+    bool owner_spill_pending(const OwnerSpillProgress& progress) const;
+    void cleanup_owner_spill(OwnerSpillProgress& progress) noexcept;
+    // No-wait teardown for the stall-abandonment guard: releases pins/state and
+    // drops pending work WITHOUT waiting on tickets or CUDA events. A torn disk
+    // entry this leaves behind is caught by its store CRC (read-side self-heal);
+    // blocking here would re-introduce the stall this path exists to escape.
+    void abandon_owner_spill(OwnerSpillProgress& progress) noexcept;
+
     struct MaterializationTransaction {
         struct KVRestorePage {
             LogicalKVPageHandle logical;
@@ -816,6 +890,7 @@ private:
             bool checkpoint_drop_published = false;
             bool mutation_published        = false;
             std::uint64_t spill_pages      = 0;
+            std::optional<OwnerSpillProgress> owner_spill;
         };
 
         std::uint64_t id = 0;
@@ -834,6 +909,8 @@ private:
         std::vector<bool> victim_released;
         std::vector<PressureWork> pressure;
         std::vector<MaterializationVictimResult> pressure_results;
+        std::size_t host_release_cursor = 0;
+        std::size_t shared_host_release_cursor = 0;
         std::size_t pressure_cursor = 0;
         std::size_t victim_count    = 0;
         std::vector<std::uint32_t> shared_victim_indices;
@@ -872,6 +949,11 @@ private:
         std::vector<DeviceKVPageHandle> backend_restore_destinations;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
+        // L3 (disk) tier restore: if a Root-path request's longest on-disk
+        // restorable prefix (computed at admission) is non-zero, materialize
+        // that prefix back onto the device (KV pages H2D + the recurrent state
+        // image) and advance the prefill past it. F is in tokens.
+        std::optional<std::uint32_t> l3_restore_frontier;
         bool state_restored                 = false;
         bool transfer_submitted             = false;
         std::uint8_t transfer_timer_mask    = 0;
@@ -1125,6 +1207,27 @@ private:
         std::vector<runtime::CheckpointRecoveryAlternativeWork>& alternatives,
         PressureRecoveryScratch& scratch, std::uint64_t& projection_work) const;
     void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
+    // L3 (disk) tier: best-effort spill of the host KV run that is about to lose
+    // its last host replica when `checkpoint` is dropped. No-op (and zero cost
+    // path-wise) unless --disk-kv-path is set. A miss on later restore falls
+    // back to exactly today's recompute, so this can never make a result wrong.
+    void spill_dying_checkpoint_pages(SequenceState& sequence, runtime::CheckpointRef checkpoint,
+                                      std::uint32_t retained_main_frontier,
+                                      std::uint32_t retained_backend_frontier);
+    // Owner-wide spill (the dominant recompute source): called from the
+    // release_sequence_kv* paths before the host pages are released. No-op
+    // unless --disk-kv-path is set.
+    void spill_dying_owner_pages(SequenceState& sequence);
+    // L3 (disk) tier — read side: seed this Root request's device KV [0,E)
+    // and the GDN state image at E from the disk tier when the admission
+    // probe marked a restorable boundary. After a true return, prefill
+    // recomputes only [E, prompt_tokens). Hard fallback: any miss/failure
+    // returns false and the sequence stays in the clean full-recompute
+    // state (staged base/cursor untouched; ordinary prefill overwrites every
+    // page). A restored byte is byte-identical to what the engine wrote
+    // (content-addressed by the digest chain), so success is bit-exact.
+    bool restore_root_from_disk(SequenceState& sequence, MaterializationTransaction& transaction,
+                                RequestControl::Prefill& staged, std::uint32_t prompt_tokens);
     [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
     [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
                                             const runtime::BatchedGeneratedRound& round);
@@ -1133,7 +1236,7 @@ private:
     [[nodiscard]] const SequenceState& active_sequence(std::uint32_t lane) const;
     [[nodiscard]] std::optional<std::uint32_t> allocate_continuation_slot() noexcept;
     [[nodiscard]] bool can_release_continuation_slot_strict(std::uint32_t index) const;
-    void release_continuation_slot_strict(std::uint32_t index) noexcept;
+    void release_continuation_slot_strict(std::uint32_t index, bool already_spilled = false) noexcept;
     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
     void retire_continuation_slot(std::uint32_t index) noexcept;
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
@@ -1230,7 +1333,7 @@ private:
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     void release_active_sequence_kv_strict(SequenceState& sequence) noexcept;
-    void release_sequence_kv_strict(SequenceState& sequence) noexcept;
+    void release_sequence_kv_strict(SequenceState& sequence, bool already_spilled = false) noexcept;
     void release_sequence_kv(SequenceState& sequence) noexcept;
     void commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                             std::uint32_t backend_tokens = 0);

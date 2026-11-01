@@ -38,6 +38,9 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // When non-null: the first prefill sample additionally stages the raw next-token logit row
+    // (token_domain BF16) into this pinned host buffer, before any MTP bridge overwrites it.
+    void* next_token_logits_capture = nullptr;
 };
 
 struct PrefillContext {

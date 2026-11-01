@@ -260,6 +260,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
+    base->top_logprobs                   = options.top_logprobs;
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
@@ -459,6 +460,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     auto plan                         = std::make_unique<AdmissionCandidateImpl>();
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
+    plan->top_logprobs                = base.top_logprobs;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
@@ -730,9 +732,206 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     }
 
     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
-    plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
-                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
+    // L3 (disk) tier read-side admission probe. A Root request with no resident
+    // prefix may still have its whole prompt-prefix restorable from disk (dead
+    // session returning after restart). Probe here — BEFORE the scheduler grant
+    // is issued — so the restorable frontier E enters the admission accounting
+    // (reusable_prompt_tokens) and the engine's prefill contract matches what
+    // materialization will actually do (seed device KV [0,E), recompute [E,prompt)).
+    // Failure to seed later keeps the accounting (the prefill then recomputes the
+    // [0,E) segment as an unreported replay; the engine-visible contract holds).
+    if (plan->reuse == ReusePath::Root && disk_kv != nullptr && disk_kv_restore) {
+        static const bool l3_trace_enter = std::getenv("NINFER_L3_TRACE") != nullptr;
+        if (l3_trace_enter) {
+            fprintf(stderr, "[l3-probe] enter src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u\n",
+                    static_cast<int>(source != nullptr), static_cast<int>(shared_source != nullptr),
+                    static_cast<int>(speculative_backend),
+                    static_cast<int>(base.summary.publish_continuation),
+                    disk_kv->slot_count(DiskKVKind::StateImage),
+                    base.prefix_digests.size(), plan->summary.prompt_tokens);
+        }
+    }
+    if (plan->reuse == ReusePath::Root && source == nullptr && shared_source == nullptr &&
+        disk_kv != nullptr && disk_kv_restore &&
+        (speculative_backend == SpeculativeBackend::None ||
+         speculative_backend == SpeculativeBackend::Mtp) &&
+        base.summary.publish_continuation &&
+        disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
+        base.prefix_digests.size() >= plan->summary.prompt_tokens &&
+        // Media prompts cannot be restored (the seed rejects them: the vision
+        // tokens' KV cannot be replayed from a tail) — promoting E for them
+        // would only force the prefill onto the unreported-replay fallback.
+        !prompt.has_media() &&
+        l3_state_scratch.has_value() && l3_kv_scratch.has_value() &&
+        plan->summary.prompt_tokens != 0) {
+        // The seed reads through scratch reserved at startup (never the shared
+        // pools); without the reservation restores are simply unavailable.
+        if (!l3_state_scratch || !l3_kv_scratch) {
+            fprintf(stderr, "[l3-probe] skip: no reserved seed scratch\n");
+        } else {
+        const std::uint32_t tag = capture_identity_tag(speculative_backend, proposal_head,
+                                                       kv_storage);
+        // Candidate-level detail is debug-only (NINFER_L3_TRACE=1): the
+        // per-candidate lines flood the log at one entry per frontier.
+        static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
+        std::optional<std::uint32_t> best_E;
+        for (const std::uint32_t E : disk_kv->live_state_frontiers()) {
+            if (E == 0) { continue; }
+            if (E >= plan->summary.prompt_tokens) {
+                if (l3_trace) {
+                    fprintf(stderr, "[l3-probe] E=%u >= prompt=%u skip\n", E,
+                            plan->summary.prompt_tokens);
+                }
+                continue;
+            }
+            const std::uint32_t full_pages = E / static_cast<std::uint32_t>(kPagedKVPageSize);
+            bool covered = full_pages != 0;
+            std::uint32_t fail_key = 0;
+            if (covered) {
+                for (std::uint32_t p = 0; p < full_pages && covered; ++p) {
+                    const auto digest = base.prefix_digests.at((p + 1) *
+                        static_cast<std::uint32_t>(kPagedKVPageSize));
+                    const DiskKVIdentity id{.lo       = digest[0],
+                                            .hi       = digest[1],
+                                            .tag      = tag,
+                                            .frontier = (p + 1) *
+                                                        static_cast<std::uint32_t>(kPagedKVPageSize)};
+                    if (!disk_kv->contains(id, DiskKVKind::MainKV)) {
+                        covered  = false;
+                        fail_key = id.frontier;
+                    }
+                }
+            }
+            if (!covered) {
+                if (l3_trace) {
+                    fprintf(stderr, "[l3-probe] E=%u main chain miss key=%u\n", E, fail_key);
+                }
+                continue;
+            }
+            if (E % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
+                const auto digest = base.prefix_digests.at(E);
+                const DiskKVIdentity id{.lo       = digest[0],
+                                        .hi       = digest[1],
+                                        .tag      = tag,
+                                        .frontier = E};
+                if (!disk_kv->contains(id, DiskKVKind::MainKV) ||
+                    !disk_kv->contains(id, DiskKVKind::StateImage)) {
+                    if (l3_trace) {
+                        fprintf(stderr, "[l3-probe] E=%u tail main=%d state=%d\n", E,
+                                static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
+                                static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
+                    }
+                    continue;
+                }
+                if (l3_trace) {
+                    fprintf(stderr,
+                            "[l3-probe] P1@%u lo=%016llx hi=%016llx tag=%u rw_n=%zu rw_tail=%u\n", E,
+                            (unsigned long long)digest[0], (unsigned long long)digest[1], tag,
+                            prompt.identity.rewrite_execution_frontiers.size(),
+                            prompt.identity.rewrite_execution_frontiers.empty()
+                                ? 0U
+                                : prompt.identity.rewrite_execution_frontiers.back());
+                }
+            } else {
+                const auto digest = base.prefix_digests.at(E);
+                const DiskKVIdentity id{.lo       = digest[0],
+                                        .hi       = digest[1],
+                                        .tag      = tag,
+                                        .frontier = E};
+                if (!disk_kv->contains(id, DiskKVKind::StateImage)) {
+                    if (l3_trace) {
+                        fprintf(stderr, "[l3-probe] E=%u (aligned) state=0\n", E);
+                    }
+                    continue;
+                }
+            }
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                // MTP draft KV is one token short of the main frontier.
+                const std::uint32_t bfrontier = backend_frontier_at(speculative_backend, E);
+                const std::uint32_t bfull_pages = bfrontier /
+                                                 static_cast<std::uint32_t>(kPagedKVPageSize);
+                bool backend_covered = true;
+                std::uint32_t bfail_key = 0;
+                for (std::uint32_t p = 0; p < bfull_pages && backend_covered; ++p) {
+                    const auto digest = base.prefix_digests.at((p + 1) *
+                        static_cast<std::uint32_t>(kPagedKVPageSize));
+                    const DiskKVIdentity id{.lo       = digest[0],
+                                            .hi       = digest[1],
+                                            .tag      = tag,
+                                            .frontier = (p + 1) *
+                                                        static_cast<std::uint32_t>(kPagedKVPageSize)};
+                    if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
+                        backend_covered = false;
+                        bfail_key       = id.frontier;
+                    }
+                }
+                if (backend_covered && bfrontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
+                    const auto digest = base.prefix_digests.at(bfrontier);
+                    const DiskKVIdentity id{.lo       = digest[0],
+                                            .hi       = digest[1],
+                                            .tag      = tag,
+                                            .frontier = bfrontier};
+                    if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
+                        backend_covered = false;
+                        bfail_key       = bfrontier;
+                    }
+                }
+                if (!backend_covered) {
+                    if (l3_trace) {
+                        fprintf(stderr, "[l3-probe] E=%u backend miss bf=%u key=%u\n", E,
+                                bfrontier, bfail_key);
+                    }
+                    continue;
+                }
+            }
+            if (!best_E || E > *best_E) { best_E = E; }
+        }
+        if (best_E) {
+            fprintf(stderr, "[l3-probe] best_E=%u\n", *best_E);
+            const std::uint32_t E = *best_E;
+            plan->reuse_base                     = E;
+            plan->summary.reusable_prompt_tokens = E;
+            // The capture groups / shared candidates above were filtered against
+            // reuse_base = 0 BEFORE this probe ran. Raising reuse_base to E makes
+            // every boundary at or inside [0, E] uncapturable (the prefix is
+            // reused wholesale); leaving them in trips the materialization
+            // validation ("planned capture identity is invalid").
+            plan->capture_groups.erase(
+                std::remove_if(plan->capture_groups.begin(), plan->capture_groups.end(),
+                               [E](const CaptureGroup& group) {
+                                   const bool base_shared_promotion =
+                                       group.frontier == E && group.shared && !group.rewrite &&
+                                       !group.long_anchor;
+                                   return group.frontier <= E && !base_shared_promotion;
+                               }),
+                plan->capture_groups.end());
+            plan->shared_candidates.erase(
+                std::remove_if(plan->shared_candidates.begin(), plan->shared_candidates.end(),
+                               [E](const CaptureGroup& group) { return group.frontier < E; }),
+                plan->shared_candidates.end());
+            // The frontend's reply-boundary rewrite checkpoint sits at the tail
+            // of the prompt (usually E or below it): replacing it requires a
+            // capture at that frontier, which no longer exists inside the reused
+            // prefix. Drop it — the L3 restore already delivers state [0, E).
+            if (base.rewrite_checkpoint &&
+                plan->rewrite_disposition ==
+                    RewriteCheckpointDisposition::ReplaceAtCommittedFrontier &&
+                base.rewrite_checkpoint->frontier <= E) {
+                plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
+            }
+        } else {
+            if (l3_trace) { fprintf(stderr, "[l3-probe] no candidate passed\n"); }
+        }
+        }  // closes the host-state-slot availability else
+    }
+    // L3 (disk) restore: the plan KEEPS the base plan's service-work booking,
+    // which was projected over the FULL prompt with ALL capture/rewrite
+    // boundaries (reuse_base = 0). Re-projecting here with the promoted plan's
+    // filtered capture set would under-book: the promotion erases sub-E
+    // captures, and a failed disk seed physically recomputes [0, E) — the
+    // honest fallback then consumes more units than a filtered projection
+    // granted (observed: "consumed 4 quanta with 3 remaining"). A successful
+    // seed simply leaves its unused units unspent.
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {

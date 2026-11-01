@@ -137,6 +137,29 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Opt-in retention policy for ONE long-lived conversation whose prompt only ever grows.
+    // A capture that the current request has proven to extend a resident checkpoint -- an exact
+    // shortlist-key match at that resident's frontier -- inherits the resident's demonstrated
+    // demand, so rolling the frontier forward is value-positive instead of competing against
+    // its own history. Off by default: when concurrent conversations share a prefix, this lets
+    // one conversation's extension evict the prefix the others depend on.
+    bool rolling_retention = false;
+    // L3 (disk) cold tier. Empty path = disabled (two-tier behavior, byte-identical).
+    // When set, host KV pages that are about to lose their last host replica
+    // (checkpoint drop under pressure) are spilled to per-family files under
+    // this directory so a later re-admission can restore them instead of
+    // re-prefilling. disk_kv_gib is the total spill budget (split across the
+    // KV families); 0 with a path set defaults to 64 GiB.
+    std::string disk_kv_path;
+    std::uint32_t disk_kv_gib = 0;
+    // Read side of the L3 tier: when a Root request arrives and its prefix
+    // [0, F) is restorable from disk (KV pages AND the GDN state image at F),
+    // materialize them into the fresh sequence (disk read + H2D + state load)
+    // and prefill only [F, prompt) instead of the whole prompt. Default off:
+    // with it off, the tier is write-only (probe/logging) and behavior is
+    // byte-identical to two-tier. Any restore failure falls back to full
+    // recompute (never worse than today).
+    bool disk_kv_restore = false;
 };
 
 struct ContextCostOptions {
@@ -261,6 +284,9 @@ struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // Export the top-K next-token probabilities of the first generated token. 0/absent means
+    // no export. The export is a prefill-only side channel and never affects sampling.
+    std::optional<std::uint32_t> top_logprobs;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -742,6 +768,15 @@ struct MaterializationDiagnostics {
                const MaterializationDiagnostics&) noexcept = default;
 };
 
+// One entry of the next-token probability distribution exported from a generation request.
+// Probability is the exact full-vocabulary softmax over the raw prefill logits (no sampling
+// temperature/penalties applied), so the exported entries sum to at most 1.
+struct TopLogprob {
+    std::uint32_t token_id   = 0;
+    float         probability = 0.0F;
+    std::string   token_text;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -759,6 +794,11 @@ struct GenerationResult {
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
+    // Set only when the request asked for next-token log probabilities (RequestOptions::
+    // top_logprobs). Contains the sorted top-K of the exact next-token distribution for the
+    // first generated token; the distribution is computed from prefill logits and does not
+    // require any decode round.
+    std::optional<std::vector<TopLogprob>> next_token_top_logprobs;
 };
 
 struct ArenaMemorySummary {

@@ -689,6 +689,9 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch<Variant>> pending;
     std::optional<CaptureOffer<Variant>> capture;
+    // Exact top-K next-token distribution of the first generated token; present only on the
+    // completing step when the request enabled the export (never affects sampling).
+    std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
 };
 
 enum class CaptureStatePlacement : std::uint8_t {

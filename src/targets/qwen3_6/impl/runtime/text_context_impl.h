@@ -1206,6 +1206,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
                 }
+                // Next-token distribution export: stage the raw logit row into the request's
+                // pinned host buffer before the MTP proposal step reuses io_.logits. Stream
+                // ordering guarantees this copy reads the prefill logits.
+                if (next_token_logits_capture_ != nullptr) {
+                    CUDA_CHECK(cudaMemcpyAsync(next_token_logits_capture_, logits.data,
+                                               kCfg.token_domain * sizeof(std::uint16_t),
+                                               cudaMemcpyDeviceToHost, s));
+                }
             }
 
             if (prepare_mtp_prompt) {
